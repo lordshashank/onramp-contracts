@@ -51,6 +51,14 @@ contract DealClient is AxelarExecutable {
     mapping(bytes => Status) public pieceStatus;
     mapping(bytes => uint256) public providerGasFunds; // Funds set aside for calling oracle by provider
     mapping(uint256 => DestinationChain) public chainIdToDestinationChain;
+    event DealNotify(
+        uint64 dealId,
+        bytes commP,
+        bytes data,
+        bytes chainId,
+        bytes provider,
+        bytes payload
+    );
 
     constructor(
         address _gateway,
@@ -109,7 +117,7 @@ contract DealClient is AxelarExecutable {
         int64 duration = CommonTypes.ChainEpoch.unwrap(proposal.end_epoch) -
             CommonTypes.ChainEpoch.unwrap(proposal.start_epoch);
         // Expects deal label to be chainId encoded in bytes
-        uint256 chainId = abi.decode(proposal.label.data, (uint256));
+        uint256 chainId = asciiBytesToUint(proposal.label.data);
         DataAttestation memory attest = DataAttestation(
             proposal.piece_cid.data,
             duration,
@@ -117,6 +125,15 @@ contract DealClient is AxelarExecutable {
             uint256(Status.DealPublished)
         );
         bytes memory payload = abi.encode(attest);
+
+        emit DealNotify(
+            mdnp.dealId,
+            proposal.piece_cid.data,
+            params,
+            proposal.label.data,
+            proposal.provider.data,
+            payload
+        );
         if (chainId == block.chainid) {
             IBridgeContract(
                 chainIdToDestinationChain[chainId].destinationAddress
@@ -224,5 +241,17 @@ contract DealClient is AxelarExecutable {
         address _addr
     ) internal pure returns (string memory) {
         return Strings.toHexString(uint256(uint160(_addr)), 20);
+    }
+
+    function asciiBytesToUint(
+        bytes memory asciiBytes
+    ) public pure returns (uint256) {
+        uint256 result = 0;
+        for (uint256 i = 0; i < asciiBytes.length; i++) {
+            uint256 digit = uint256(uint8(asciiBytes[i])) - 48; // Convert ASCII to digit
+            require(digit <= 9, "Invalid ASCII byte");
+            result = result * 10 + digit;
+        }
+        return result;
     }
 }
