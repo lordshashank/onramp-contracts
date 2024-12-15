@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"math/bits"
+
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,31 +28,32 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	boosttypes "github.com/filecoin-project/boost/storagemarket/types"
 	boosttypes2 "github.com/filecoin-project/boost/transport/types"
 	"github.com/filecoin-project/go-address"
 	cborutil "github.com/filecoin-project/go-cbor-util"
+	gocrypto "github.com/filecoin-project/go-crypto"
 	"github.com/filecoin-project/go-data-segment/datasegment"
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-jsonrpc"
-	inet "github.com/libp2p/go-libp2p/core/network"
-
 	filabi "github.com/filecoin-project/go-state-types/abi"
 	fbig "github.com/filecoin-project/go-state-types/big"
 	builtintypes "github.com/filecoin-project/go-state-types/builtin"
 	"github.com/filecoin-project/go-state-types/builtin/v9/market"
-	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/lotus/api/v0api"
 	lotustypes "github.com/filecoin-project/lotus/chain/types"
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
+	inet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mitchellh/go-homedir"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/crypto/blake2b"
 )
 
 func main() {
@@ -238,7 +241,9 @@ type Config struct {
 	TransferPort  int
 	ProviderAddr  string
 	LotusAPI      string
-	TargetAggSize int
+	LighthouseApiKey string
+	AuthToken         string
+    TargetAggSize    int
 }
 
 // Mirror OnRamp.sol's `Offer` struct
@@ -279,6 +284,8 @@ type aggregator struct {
 	transferID     int                       // ID of the next transfer
 	transferAddr   string                    // address to listen for transfer requests
 	targetDealSize uint64                    // how big aggregates should be
+	minDealSize	   uint64                    // minimum deal size
+	lighthouseApiKey string 					// API key for lighthouse
 	host           host.Host                 // libp2p host for deal protocol to boost
 	spDealAddr     *peer.AddrInfo            // address to reach boost (or other) deal v 1.2 provider
 	spActorAddr    address.Address           // address of the storage provider actor
@@ -351,7 +358,7 @@ func NewAggregator(ctx context.Context, cfg *Config) (*aggregator, error) {
 		return nil, err
 	}
 
-	lAPI, closer, err := NewLotusDaemonAPIClientV0(ctx, cfg.LotusAPI, 1, "")
+	lAPI, closer, err := NewLotusDaemonAPIClientV0(ctx, cfg.LotusAPI, 1, cfg.AuthToken)
 	if err != nil {
 		return nil, err
 	}
@@ -401,6 +408,7 @@ func NewAggregator(ctx context.Context, cfg *Config) (*aggregator, error) {
 		spDealAddr:     psPeerInfo,
 		spActorAddr:    providerAddr,
 		lotusAPI:       lAPI,
+		lighthouseApiKey: cfg.LighthouseApiKey,
 		cleanup: func() {
 			closer()
 			fmt.Printf("done with lotus api closer\n")
@@ -424,7 +432,10 @@ func (a *aggregator) run(ctx context.Context) error {
 		}
 
 		err := a.SubscribeQuery(ctx, query)
-		for err == nil || strings.Contains(err.Error(), "read tcp") {
+		// if err != nil {
+		// 	return err
+		// }
+		for err == nil || strings.Contains(err.Error(), "read udp") {
 			if err != nil {
 				log.Printf("ignoring mystery error: %s", err)
 			}
@@ -483,7 +494,7 @@ const (
 	// libp2p identifier for latest deal protocol
 	DealProtocolv120 = "/fil/storage/mk/1.2.0"
 	// Delay to start deal at. For 2k devnet 4 second block time this is 13.3 minutes TODO Config
-	dealDelayEpochs = 200
+	dealDelayEpochs = 10000
 	// Storage deal duration, TODO figure out what to do about this, either comes from offer or config
 	dealDuration = 518400 // 6 months (on mainnet)
 )
@@ -491,12 +502,13 @@ const (
 func (a *aggregator) runAggregate(ctx context.Context) error {
 	// pieces being aggregated, flushed upon commitment
 	// Invariant: the pieces in the pending queue can always make a valid aggregate w.r.t a.targetDealSize
-	pending := make([]DataReadyEvent, 0, 256)
+	// pending := make([]DataReadyEvent, 0, 256)
+	var pending []DataReadyEvent
 	total := uint64(0)
-	prefixPiece := filabi.PieceInfo{
-		Size:     filabi.PaddedPieceSize(prefixCARSizePadded),
-		PieceCID: cid.MustParse(prefixCARCid),
-	}
+	// prefixPiece := filabi.PieceInfo{
+	// 	Size:     filabi.PaddedPieceSize(prefixCARSizePadded),
+	// 	PieceCID: cid.MustParse(prefixCARCid),
+	// }
 
 	for {
 		select {
@@ -504,15 +516,17 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 			fmt.Printf("ctx done shutting down aggregation")
 			return nil
 		case latestEvent := <-a.ch:
-			// Check if the offer is too big to fit in a valid aggregate on its own
+			if len(pending) >= 0 {
+							// Check if the offer is too big to fit in a valid aggregate on its own
 			// TODO: as referenced below there must be a better way when we introspect on the gory details of NewAggregate
 			latestPiece, err := latestEvent.Offer.Piece()
+			pending = append(pending, latestEvent)
 			if err != nil {
 				log.Printf("skipping offer %d, size %d not valid padded piece size ", latestEvent.OfferID, latestEvent.Offer.Size)
 				continue
 			}
 			_, err = datasegment.NewAggregate(filabi.PaddedPieceSize(a.targetDealSize), []filabi.PieceInfo{
-				prefixPiece,
+				// prefixPiece,
 				latestPiece,
 			})
 			if err != nil {
@@ -528,7 +542,7 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 			//      all the gory edge cases in NewAggregate
 
 			// Turn offers into datasegment pieces
-			pieces := make([]filabi.PieceInfo, len(pending)+1)
+			pieces := make([]filabi.PieceInfo, len(pending))
 			for i, event := range pending {
 				piece, err := event.Offer.Piece()
 				if err != nil {
@@ -537,18 +551,31 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 				pieces[i] = piece
 			}
 
-			pieces[len(pending)] = latestPiece
+			// pieces[len(pending)] = latestPiece
 			// aggregate
-			aggregatePieces := append([]filabi.PieceInfo{
-				prefixPiece,
-			}, pieces...)
-			_, err = datasegment.NewAggregate(filabi.PaddedPieceSize(a.targetDealSize), aggregatePieces)
-			if err != nil { // we've overshot, lets commit to just pieces in pending
+			// aggregatePieces := append([]filabi.PieceInfo{
+			// 	prefixPiece,
+			// }, pieces...)
+			aggregatePieces := pieces
+			_, size, err := datasegment.ComputeDealPlacement(aggregatePieces)
+			if err != nil {
+				panic(err)
+			}
+			overallSize := filabi.PaddedPieceSize(size)
+			next := 1 << (64 - bits.LeadingZeros64(uint64(overallSize+256)))
+			if next < int(a.minDealSize) {
+				next = int(a.minDealSize)
+			}
+			dealSize := filabi.PaddedPieceSize(next)
+			a.targetDealSize = uint64(dealSize)
+			// _, err = datasegment.NewAggregate(dealSize, aggregatePieces)
+			// if err != nil { // we've overshot, lets commit to just pieces in pending
 				total = 0
+
 				// Remove the latest offer which took us over
-				pieces = pieces[:len(pieces)-1]
-				aggregatePieces = aggregatePieces[:len(aggregatePieces)-1]
-				agg, err := datasegment.NewAggregate(filabi.PaddedPieceSize(a.targetDealSize), aggregatePieces)
+				// pieces = pieces[:len(pieces)-1]
+				// aggregatePieces = aggregatePieces[:len(aggregatePieces)-1]
+				agg, err := datasegment.NewAggregate(dealSize, aggregatePieces)
 				if err != nil {
 					return fmt.Errorf("failed to create aggregate from pending, should not be reachable: %w", err)
 				}
@@ -593,17 +620,44 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 				a.transferID++
 				a.transferLk.Unlock()
 				log.Printf("Transfer ID %d scheduled for aggregate %s", transferID, aggCommp.String())
-
-				err = a.sendDeal(ctx, aggCommp, transferID)
+				aggLocation := `~/` + aggCommp.String()
+				err = a.saveAggregateToFile(transferID, aggLocation)
+				if err != nil {
+					log.Fatalf("failed to save aggregate to file: %s", err)
+				}
+				// send file to lighthouse
+				lhResp, err := UploadToLighthouse(aggLocation, a.lighthouseApiKey)
+				if err != nil {
+					log.Fatalf("failed to upload to lighthouse: %s", err)
+				}
+				retrievalURL := fmt.Sprintf("https://gateway.lighthouse.storage/ipfs/%s", lhResp.Hash)
+				err = a.sendDeal(ctx, aggCommp, retrievalURL);
 				if err != nil {
 					log.Printf("[ERROR] failed to send deal: %s", err)
 				}
-
+                // Delete the file at aggLocation
+                err = os.Remove(aggLocation)
+                if err != nil {
+                    log.Printf("[ERROR] failed to delete file at %s: %s", aggLocation, err)
+                }
 				// Reset queue to empty, add the event that triggered aggregation
 				pending = pending[:0]
-				pending = append(pending, latestEvent)
+				// pending = append(pending, latestEvent)
 
 			} else {
+				latestPiece, err := latestEvent.Offer.Piece()
+				if err != nil {
+					log.Printf("skipping offer %d, size %d not valid padded piece size ", latestEvent.OfferID, latestEvent.Offer.Size)
+					continue
+				}
+				_, err = datasegment.NewAggregate(filabi.PaddedPieceSize(a.targetDealSize), []filabi.PieceInfo{
+					// prefixPiece,
+					latestPiece,
+				})
+				if err != nil {
+					log.Printf("skipping offer %d, size %d exceeds max PODSI packable size", latestEvent.OfferID, latestEvent.Offer.Size)
+					continue
+				}
 				total += latestEvent.Offer.Size
 				pending = append(pending, latestEvent)
 				log.Printf("Offer %d added. %d offers pending aggregation with total size=%d\n", latestEvent.OfferID, len(pending), total)
@@ -615,7 +669,7 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 // Send deal data to the configured SP deal making address (boost node)
 // The deal is made with the configured prover client contract
 // Heavily inspired by boost client
-func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, transferID int) error {
+func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, url string) error {
 	if err := a.host.Connect(ctx, *a.spDealAddr); err != nil {
 		return fmt.Errorf("failed to connect to peer %s: %w", a.spDealAddr.ID, err)
 	}
@@ -631,7 +685,8 @@ func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, transferID 
 	dealUuid := uuid.New()
 	log.Printf("making deal for commp %s, UUID=%s\n", aggCommp.String(), dealUuid)
 	transferParams := boosttypes2.HttpRequest{
-		URL: fmt.Sprintf("http://%s/?id=%d", a.transferAddr, transferID),
+
+		URL: url,
 	}
 	paramsBytes, err := json.Marshal(transferParams)
 	if err != nil {
@@ -639,7 +694,7 @@ func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, transferID 
 	}
 	transfer := boosttypes.Transfer{
 		Type:     "http",
-		ClientID: fmt.Sprintf("%d", transferID),
+		// ClientID: fmt.Sprintf("%d", transferID),
 		Params:   paramsBytes,
 		Size:     a.targetDealSize - a.targetDealSize/128, // aggregate for transfer is not fr32 encoded
 	}
@@ -666,37 +721,88 @@ func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, transferID 
 		return fmt.Errorf("failed to get chain ID: %w", err)
 	}
 	// Encode the chainID as uint256
-	encodedChainID, err := encodeChainID(chainID)
+	// intEncodedChainID, err := encodeChainID(chainID)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to encode chainID: %w", err)
+	// }
+
+	clientAddr, err := a.lotusAPI.WalletDefaultAddress(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to encode chainID: %w", err)
+		return err
 	}
-	dealLabel, err := market.NewLabelFromBytes(encodedChainID)
+	dummyBuf, err := cborutil.Dump("dummy")
+	if err != nil {
+		return err
+	}
+	dummySig, err := a.lotusAPI.WalletSign(ctx, clientAddr, dummyBuf)
+	if err != nil {
+		return fmt.Errorf("wallet sign failed: %w", err)
+	}
+	b2sum := blake2b.Sum256(dummyBuf)
+	pubk, err := gocrypto.EcRecover(b2sum[:], dummySig.Data)
+	if err != nil {
+		return err
+	}
+	pubkHash := ethcrypto.Keccak256(pubk[1:]) // Skip the first byte (0x04) which indicates uncompressed public key
+	ethAddress := common.BytesToAddress(pubkHash[12:]) // Take the last 20 bytes
+	encodedLabel, err := encodeChainIDAndAddress(chainID, ethAddress)
+	if err != nil {
+		return fmt.Errorf("failed to encode chainID and address: %w", err)
+	}
+	fmt.Println(ethAddress.Hex())
+	fmt.Println(hex.EncodeToString(encodedLabel))
+	dealLabel, err := market.NewLabelFromBytes(encodedLabel)
 	if err != nil {
 		return fmt.Errorf("failed to create deal label: %w", err)
 	}
-	proposal := market.ClientDealProposal{
-		Proposal: market.DealProposal{
-			PieceCID:             aggCommp,
-			PieceSize:            filabi.PaddedPieceSize(a.targetDealSize),
-			VerifiedDeal:         false,
-			Client:               filClient,
-			Provider:             a.spActorAddr,
-			StartEpoch:           dealStart,
-			EndEpoch:             dealEnd,
-			StoragePricePerEpoch: fbig.NewInt(0),
-			ProviderCollateral:   providerCollateral,
-			Label:                dealLabel,
-		},
+	// encodedChainID, err := encodeChainIDAsString(chainID)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to encode chainID: %w", err)
+	// }
+	// fmt.Println(encodedChainID)
+	// dealLabel, err := market.NewLabelFromString(encodedChainID)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to create deal label: %w", err)
+	// }
+	proposal := market.DealProposal{
+		PieceCID:             aggCommp,
+		PieceSize:            filabi.PaddedPieceSize(a.targetDealSize),
+		VerifiedDeal:         false,
+		Client:               filClient,
+		Provider:             a.spActorAddr,
+		StartEpoch:           dealStart,
+		EndEpoch:             dealEnd,
+		StoragePricePerEpoch: fbig.NewInt(0),
+		ProviderCollateral:   providerCollateral,
+		Label:                dealLabel,
+	}
+
+
+	buf, err := cborutil.Dump(&proposal)
+	if err != nil {
+		return err
+	}
+//	fmt.Println(hex.EncodeToString(buf))
+	log.Printf("about to sign with clientAddr: %s", clientAddr)
+	sig, err := a.lotusAPI.WalletSign(ctx, clientAddr, buf)
+	if err != nil {
+		return fmt.Errorf("wallet sign failed: %w", err)
+	}
+//	fmt.Println(hex.EncodeToString(sig.Data))
+
+	clientProposal := market.ClientDealProposal{
+		Proposal: proposal,
 		// Signature is unchecked since client is smart contract
-		ClientSignature: crypto.Signature{
-			Type: crypto.SigTypeBLS,
-			Data: []byte{0xc0, 0xff, 0xee},
-		},
+		ClientSignature:  *sig,
+		// crypto.Signature{
+		// 	Type: crypto.SigTypeBLS,
+		// 	Data: []byte{0xc0, 0xff, 0xee},
+		// },
 	}
 
 	dealParams := boosttypes.DealParams{
 		DealUUID:           dealUuid,
-		ClientDealProposal: proposal,
+		ClientDealProposal: clientProposal,
 		DealDataRoot:       aggCommp,
 		IsOffline:          false,
 		Transfer:           transfer,
@@ -828,6 +934,49 @@ func (a *aggregator) transferHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (a *aggregator) saveAggregateToFile(id int, location string) error {
+    a.transferLk.RLock()
+    transfer, ok := a.transfers[id]
+    a.transferLk.RUnlock()
+    if !ok {
+        return fmt.Errorf("no data found for ID %d", id)
+    }
+
+    // First write the CAR prefix to the file
+    // prefixCARBytes, err := hex.DecodeString(prefixCAR)
+    // if err != nil {
+    //     return fmt.Errorf("failed to decode CAR prefix: %w", err)
+    // }
+
+    readers := []io.Reader{
+		// bytes.NewReader(prefixCARBytes)
+		}
+    // Fetch each sub piece from its buffer location and add to readers
+    for _, url := range transfer.locations {
+        lazyReader := &lazyHTTPReader{url: url}
+        readers = append(readers, lazyReader)
+        defer lazyReader.Close()
+    }
+    aggReader, err := transfer.agg.AggregateObjectReader(readers)
+    if err != nil {
+        return fmt.Errorf("failed to create aggregate reader: %w", err)
+    }
+
+    // Create the file at the specified location
+    file, err := os.Create(location)
+    if err != nil {
+        return fmt.Errorf("failed to create file: %w", err)
+    }
+    defer file.Close()
+
+    // Copy the aggregated data to the file
+    _, err = io.Copy(file, aggReader)
+    if err != nil {
+        return fmt.Errorf("failed to write aggregate stream to file: %w", err)
+    }
+
+    return nil
+}
 type AggregateTransfer struct {
 	locations []string
 	agg       *datasegment.Aggregate
@@ -838,6 +987,7 @@ func (a *aggregator) SubscribeQuery(ctx context.Context, query ethereum.FilterQu
 	log.Printf("Listening for data ready events on %s\n", a.onrampAddr.Hex())
 	sub, err := a.client.SubscribeFilterLogs(ctx, query, logs)
 	if err != nil {
+		fmt.Println(err)
 		return err
 	}
 	defer sub.Unsubscribe()
@@ -932,7 +1082,7 @@ func MakeOffer(cidStr string, sizeStr string, location string, token string, amo
 		Amount:   amountBig,
 		Size:     uint64(size),
 	}
-
+    fmt.Println(hex.EncodeToString(commP.Bytes()))
 	return &offer, nil
 }
 
@@ -1037,5 +1187,43 @@ func encodeChainID(chainID *big.Int) ([]byte, error) {
     }
 
     return data, nil
+}
+// encodeChainIDAndAddress encodes the chain ID and Ethereum address into bytes
+func encodeChainIDAndAddress(chainID *big.Int, ethAddress common.Address) ([]byte, error) {
+	uint256Type, err := abi.NewType("uint256", "", nil)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create uint256 type: %w", err)
+    }
+
+	addressType, err := abi.NewType("address", "", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create address type: %w", err)
+	}
+	
+	
+	// Define the ABI encoding
+    arguments := abi.Arguments{
+        {Type: uint256Type},
+        {Type: addressType},
+    }
+
+    // Encode the chain ID and Ethereum address
+    encodedBytes, err := arguments.Pack(chainID, ethAddress)
+    if err != nil {
+        return nil, fmt.Errorf("error encoding arguments: %w", err)
+    }
+
+    return encodedBytes, nil
+}
+// encodeChainIDAsString converts a *big.Int chain ID to its string representation
+func encodeChainIDAsString(chainID *big.Int) (string, error) {
+    if chainID == nil {
+        return "", fmt.Errorf("chainID cannot be nil")
+    }
+
+    // Convert the *big.Int to a string
+    chainIDStr := chainID.String()
+
+    return chainIDStr, nil
 }
 
