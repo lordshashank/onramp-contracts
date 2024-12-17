@@ -18,6 +18,7 @@ import {Strings} from "lib/openzeppelin-contracts/contracts/utils/Strings.sol";
 import {AxelarExecutable} from "lib/axelar-gmp-sdk-solidity/contracts/executable/AxelarExecutable.sol";
 import {IAxelarGateway} from "lib/axelar-gmp-sdk-solidity/contracts/interfaces/IAxelarGateway.sol";
 import {IAxelarGasService} from "lib/axelar-gmp-sdk-solidity/contracts/interfaces/IAxelarGasService.sol";
+import {BLAKE2b} from "./blake2lib.sol";
 
 using CBOR for CBOR.CBORBuffer;
 
@@ -120,11 +121,12 @@ contract DealClient is AxelarExecutable {
             .deserializeAuthenticateMessageParams();
         MarketTypes.DealProposal memory proposal = MarketCBOR
             .deserializeDealProposal(amp.message);
-        (, address filAddress) = abi.decode(
-            proposal.label.data,
-            (uint256, address)
+        bytes memory encodedData = convertAsciiHexToBytes(proposal.label.data);
+        (, address filAddress) = abi.decode(encodedData, (uint256, address));
+        address recovered = recovers(
+            bytes32(BLAKE2b.hash(amp.message, "", "", "", 32)),
+            amp.signature
         );
-        address recovered = recovers(bytes32(amp.message), amp.signature);
         require(recovered == filAddress, "Invalid signature");
     }
 
@@ -151,10 +153,8 @@ contract DealClient is AxelarExecutable {
             CommonTypes.ChainEpoch.unwrap(proposal.start_epoch);
         // Expects deal label to be chainId encoded in bytes
         // string memory chainIdStr = abi.decode(proposal.label.data, (string));
-        (uint256 chainId, ) = abi.decode(
-            proposal.label.data,
-            (uint256, address)
-        );
+        bytes memory encodedData = convertAsciiHexToBytes(proposal.label.data);
+        (uint256 chainId, ) = abi.decode(encodedData, (uint256, address));
 
         // uint256 chainId = asciiBytesToUint(proposal.label.data);
         DataAttestation memory attest = DataAttestation(
@@ -262,14 +262,16 @@ contract DealClient is AxelarExecutable {
         uint64 codec;
         // dispatch methods
         if (method == AUTHENTICATE_MESSAGE_METHOD_NUM) {
+            authenticateMessage(params);
             // If we haven't reverted, we should return a CBOR true to indicate that verification passed.
-            // Always authenticate message
             CBOR.CBORBuffer memory buf = CBOR.create(1);
             buf.writeBool(true);
             ret = buf.data();
             codec = Misc.CBOR_CODEC;
         } else if (method == MARKET_NOTIFY_DEAL_METHOD_NUM) {
             dealNotify(params);
+        } else if (method == DATACAP_RECEIVER_HOOK_METHOD_NUM) {
+            receiveDataCap(params);
         } else {
             revert("the filecoin method that was called is not handled");
         }
@@ -292,6 +294,28 @@ contract DealClient is AxelarExecutable {
             result = result * 10 + digit;
         }
         return result;
+    }
+
+    function convertAsciiHexToBytes(
+        bytes memory asciiHex
+    ) public pure returns (bytes memory) {
+        require(asciiHex.length % 2 == 0, "Invalid ASCII hex string length");
+
+        bytes memory result = new bytes(asciiHex.length / 2);
+        for (uint256 i = 0; i < asciiHex.length / 2; i++) {
+            result[i] = byteFromHexChar(asciiHex[2 * i], asciiHex[2 * i + 1]);
+        }
+
+        return result;
+    }
+
+    function byteFromHexChar(
+        bytes1 char1,
+        bytes1 char2
+    ) internal pure returns (bytes1) {
+        uint8 nibble1 = uint8(char1) - (uint8(char1) < 58 ? 48 : 87);
+        uint8 nibble2 = uint8(char2) - (uint8(char2) < 58 ? 48 : 87);
+        return bytes1(nibble1 * 16 + nibble2);
     }
 
     function recovers(

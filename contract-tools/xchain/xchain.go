@@ -749,21 +749,13 @@ func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, url string)
 	if err != nil {
 		return fmt.Errorf("failed to encode chainID and address: %w", err)
 	}
-	fmt.Println(ethAddress.Hex())
-	fmt.Println(hex.EncodeToString(encodedLabel))
-	dealLabel, err := market.NewLabelFromBytes(encodedLabel)
+	labelString := hex.EncodeToString(encodedLabel)
+
+	dealLabel, err := market.NewLabelFromString(labelString)
 	if err != nil {
 		return fmt.Errorf("failed to create deal label: %w", err)
 	}
-	// encodedChainID, err := encodeChainIDAsString(chainID)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to encode chainID: %w", err)
-	// }
-	// fmt.Println(encodedChainID)
-	// dealLabel, err := market.NewLabelFromString(encodedChainID)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to create deal label: %w", err)
-	// }
+
 	proposal := market.DealProposal{
 		PieceCID:             aggCommp,
 		PieceSize:            filabi.PaddedPieceSize(a.targetDealSize),
@@ -782,13 +774,12 @@ func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, url string)
 	if err != nil {
 		return err
 	}
-//	fmt.Println(hex.EncodeToString(buf))
+	
 	log.Printf("about to sign with clientAddr: %s", clientAddr)
 	sig, err := a.lotusAPI.WalletSign(ctx, clientAddr, buf)
 	if err != nil {
 		return fmt.Errorf("wallet sign failed: %w", err)
 	}
-//	fmt.Println(hex.EncodeToString(sig.Data))
 
 	clientProposal := market.ClientDealProposal{
 		Proposal: proposal,
