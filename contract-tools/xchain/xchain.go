@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +19,9 @@ import (
 	"sync"
 	"time"
 
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	gocrypto "github.com/filecoin-project/go-crypto"
+	"golang.org/x/crypto/blake2b"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/ethereum/go-ethereum"
@@ -28,16 +30,16 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	boosttypes "github.com/filecoin-project/boost/storagemarket/types"
 	boosttypes2 "github.com/filecoin-project/boost/transport/types"
 	"github.com/filecoin-project/go-address"
 	cborutil "github.com/filecoin-project/go-cbor-util"
-	gocrypto "github.com/filecoin-project/go-crypto"
 	"github.com/filecoin-project/go-data-segment/datasegment"
 	"github.com/filecoin-project/go-data-segment/merkletree"
 	"github.com/filecoin-project/go-jsonrpc"
+	inet "github.com/libp2p/go-libp2p/core/network"
+
 	filabi "github.com/filecoin-project/go-state-types/abi"
 	fbig "github.com/filecoin-project/go-state-types/big"
 	builtintypes "github.com/filecoin-project/go-state-types/builtin"
@@ -48,12 +50,10 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
-	inet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mitchellh/go-homedir"
 	"github.com/multiformats/go-multiaddr"
 	"github.com/urfave/cli/v2"
-	"golang.org/x/crypto/blake2b"
 )
 
 func main() {
@@ -74,63 +74,59 @@ func main() {
 				Usage: "Start the xchain adapter daemon",
 				Flags: []cli.Flag{
 					&cli.BoolFlag{
-						Name:  "buffer-service",
-						Usage: "Run a buffer server",
-						Value: false,
-					},
-					&cli.BoolFlag{
 						Name:  "aggregation-service",
 						Usage: "Run an aggregation server",
 						Value: false,
 					},
 				},
 				Action: func(cctx *cli.Context) error {
-					isBuffer := cctx.Bool("buffer-service")
-					isAgg := cctx.Bool("aggregation-service")
-					if !isBuffer && !isAgg { // default to running aggregator
-						isAgg = true
+					isAgg := cctx.Bool("aggregation-service") 
+					if !isAgg {
+						isAgg = true // default to running aggregator
 					}
-
+	
 					cfg, err := LoadConfig(cctx.String("config"))
 					if err != nil {
 						log.Fatal(err)
 					}
-
+	
 					g, ctx := errgroup.WithContext(cctx.Context)
+					
+					// Start buffer service if using local buffer
 					g.Go(func() error {
-						if !isBuffer {
-							return nil
-						}
-						path, err := homedir.Expand(cfg.BufferPath)
-						if err != nil {
-							return err
-						}
-						if err := os.MkdirAll(path, os.ModePerm); err != nil {
-							return err
-						}
-
-						srv, err := NewBufferHTTPService(cfg.BufferPath)
-						if err != nil {
-							return &http.MaxBytesError{}
-						}
-						http.HandleFunc("/put", srv.PutHandler)
-						http.HandleFunc("/get", srv.GetHandler)
-
-						fmt.Printf("Server starting on port %d\n", cfg.BufferPort)
-						server := &http.Server{
-							Addr:    fmt.Sprintf("0.0.0.0:%d", cfg.BufferPort),
-							Handler: nil, // http.DefaultServeMux
-						}
-						go func() {
-							if err := server.ListenAndServe(); err != http.ErrServerClosed {
-								log.Fatalf("Buffer HTTP server ListenAndServe: %v", err)
+						if cfg.BufferType == "local" {
+							path, err := homedir.Expand(cfg.BufferPath)
+							if err != nil {
+								return err
 							}
-						}()
-						<-ctx.Done()
-
-						// Context is cancelled, shut down the server
-						return server.Shutdown(context.Background())
+							if err := os.MkdirAll(path, os.ModePerm); err != nil {
+								return err
+							}
+	
+							srv, err := NewBufferHTTPService(cfg.BufferPath)
+							if err != nil {
+								return err
+							}
+							http.HandleFunc("/put", srv.PutHandler) 
+							http.HandleFunc("/get", srv.GetHandler)
+	
+							fmt.Printf("Local buffer server starting on port %d\n", cfg.BufferPort)
+							server := &http.Server{
+								Addr:    fmt.Sprintf("0.0.0.0:%d", cfg.BufferPort),
+								Handler: nil,
+							}
+							go func() {
+								if err := server.ListenAndServe(); err != http.ErrServerClosed {
+									log.Fatalf("Buffer HTTP server ListenAndServe: %v", err)
+								}
+							}()
+							<-ctx.Done()
+							return server.Shutdown(context.Background())
+						}
+						return nil
 					})
+	
+					// Start aggregator service
 					g.Go(func() error {
 						if !isAgg {
 							return nil
@@ -244,6 +240,7 @@ type Config struct {
 	LighthouseApiKey string
 	AuthToken         string
     TargetAggSize    int
+	BufferType string // "lighthouse" or "local"
 }
 
 // Mirror OnRamp.sol's `Offer` struct
@@ -291,6 +288,7 @@ type aggregator struct {
 	spActorAddr    address.Address           // address of the storage provider actor
 	lotusAPI       v0api.FullNode            // Lotus API for determining deal start epoch and collateral bounds
 	cleanup        func()                    // cleanup function to call on shutdown
+	bufferType 	   string 					 // Type of buffer to use
 }
 
 // Thank you @ribasushi
@@ -413,6 +411,7 @@ func NewAggregator(ctx context.Context, cfg *Config) (*aggregator, error) {
 			closer()
 			fmt.Printf("done with lotus api closer\n")
 		},
+		bufferType: cfg.BufferType,
 	}, nil
 }
 
@@ -477,18 +476,6 @@ func (a *aggregator) run(ctx context.Context) error {
 }
 
 const (
-	// PODSI aggregation uses 64 extra bytes per piece
-	// pieceOverhead = uint64(64) TODO uncomment this when we are smarter about determining threshold crossing
-	// Piece CID of small valid car (below) that must be prepended to the aggregation for deal acceptance
-	prefixCARCid = "baga6ea4seaqiklhpuei4wz7x3wwpvnul3sscfyrz2dpi722vgpwlolfky2dmwey"
-	// Hex of the prefix car file
-	prefixCAR = "3aa265726f6f747381d82a58250001701220b9ecb605f194801ee8a8355014e7e6e62966f94ccb6081" +
-		"631e82217872209dae6776657273696f6e014101551220704a26a32a76cf3ab66ffe41eb27adefefe9c93206960bb0" +
-		"147b9ed5e1e948b0576861744966487567684576657265747449494957617352696768743f5601701220b9ecb605f1" +
-		"94801ee8a8355014e7e6e62966f94ccb6081631e82217872209dae122c0a2401551220704a26a32a76cf3ab66ffe41" +
-		"eb27adefefe9c93206960bb0147b9ed5e1e948b012026576181d0a020801"
-	// Size of the padded prefix car in bytes
-	prefixCARSizePadded = uint64(256)
 	// Data transfer port
 	transferPort = 1728
 	// libp2p identifier for latest deal protocol
@@ -505,10 +492,6 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 	// pending := make([]DataReadyEvent, 0, 256)
 	var pending []DataReadyEvent
 	total := uint64(0)
-	// prefixPiece := filabi.PieceInfo{
-	// 	Size:     filabi.PaddedPieceSize(prefixCARSizePadded),
-	// 	PieceCID: cid.MustParse(prefixCARCid),
-	// }
 
 	for {
 		select {
@@ -531,16 +514,9 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 			})
 			if err != nil {
 				log.Printf("error creating aggregate: %s", err)
-				log.Printf("skipping offer %d, size %d exceeds max PODSI packable size %d", latestEvent.OfferID, latestEvent.Offer.Size, a.targetDealSize)
 				continue
 			}
 			// TODO: in production we'll maybe want to move data from buffer before we commit to storing it.
-
-			// TODO: Unsorted greedy is a very naive knapsack strategy, production will want something better
-			// TODO: doing all the work of creating an aggregate for every new offer is quite wasteful
-			//      there must be a cheaper way to do this, but for now it is the most expediant without learning
-			//      all the gory edge cases in NewAggregate
-
 			// Turn offers into datasegment pieces
 			pieces := make([]filabi.PieceInfo, len(pending))
 			for i, event := range pending {
@@ -551,11 +527,6 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 				pieces[i] = piece
 			}
 
-			// pieces[len(pending)] = latestPiece
-			// aggregate
-			// aggregatePieces := append([]filabi.PieceInfo{
-			// 	prefixPiece,
-			// }, pieces...)
 			aggregatePieces := pieces
 			_, size, err := datasegment.ComputeDealPlacement(aggregatePieces)
 			if err != nil {
@@ -620,26 +591,14 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 				a.transferID++
 				a.transferLk.Unlock()
 				log.Printf("Transfer ID %d scheduled for aggregate %s", transferID, aggCommp.String())
-				aggLocation := `~/` + aggCommp.String()
-				err = a.saveAggregateToFile(transferID, aggLocation)
-				if err != nil {
-					log.Fatalf("failed to save aggregate to file: %s", err)
-				}
-				// send file to lighthouse
-				lhResp, err := UploadToLighthouse(aggLocation, a.lighthouseApiKey)
-				if err != nil {
-					log.Fatalf("failed to upload to lighthouse: %s", err)
-				}
-				retrievalURL := fmt.Sprintf("https://gateway.lighthouse.storage/ipfs/%s", lhResp.Hash)
-				err = a.sendDeal(ctx, aggCommp, retrievalURL);
+
+
+
+				err = a.sendDeal(ctx, aggCommp, transferID);
 				if err != nil {
 					log.Printf("[ERROR] failed to send deal: %s", err)
 				}
-                // Delete the file at aggLocation
-                err = os.Remove(aggLocation)
-                if err != nil {
-                    log.Printf("[ERROR] failed to delete file at %s: %s", aggLocation, err)
-                }
+
 				// Reset queue to empty, add the event that triggered aggregation
 				pending = pending[:0]
 				// pending = append(pending, latestEvent)
@@ -669,7 +628,7 @@ func (a *aggregator) runAggregate(ctx context.Context) error {
 // Send deal data to the configured SP deal making address (boost node)
 // The deal is made with the configured prover client contract
 // Heavily inspired by boost client
-func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, url string) error {
+func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, transferID int) error {
 	if err := a.host.Connect(ctx, *a.spDealAddr); err != nil {
 		return fmt.Errorf("failed to connect to peer %s: %w", a.spDealAddr.ID, err)
 	}
@@ -680,12 +639,30 @@ func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, url string)
 	if len(x) == 0 {
 		return fmt.Errorf("cannot make a deal with storage provider %s because it does not support protocol version 1.2.0", a.spDealAddr.ID)
 	}
+	// make serving url as per buffer
+    var url string
+    if a.bufferType == "lighthouse" {
+        // Upload to Lighthouse
+		aggLocation := `~/` + aggCommp.String()
+        err = a.saveAggregateToFile(transferID, aggLocation)
+        if err != nil {
+            log.Fatalf("failed to save aggregate to file: %s", err)
+        }
+        
+        lhResp, err := UploadToLighthouse(aggLocation, a.lighthouseApiKey)
+        if err != nil {
+            log.Fatalf("failed to upload to lighthouse: %s", err)
+        }
+        url = fmt.Sprintf("https://gateway.lighthouse.storage/ipfs/%s", lhResp.Hash)
+    } else {
+        // Use local buffer
+        url = fmt.Sprintf("http://%s/?id=%d", a.transferAddr, transferID)
+    }
 
 	// Construct deal
 	dealUuid := uuid.New()
 	log.Printf("making deal for commp %s, UUID=%s\n", aggCommp.String(), dealUuid)
 	transferParams := boosttypes2.HttpRequest{
-
 		URL: url,
 	}
 	paramsBytes, err := json.Marshal(transferParams)
@@ -694,7 +671,7 @@ func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, url string)
 	}
 	transfer := boosttypes.Transfer{
 		Type:     "http",
-		// ClientID: fmt.Sprintf("%d", transferID),
+		ClientID: fmt.Sprintf("%d", transferID),
 		Params:   paramsBytes,
 		Size:     a.targetDealSize - a.targetDealSize/128, // aggregate for transfer is not fr32 encoded
 	}
@@ -755,7 +732,6 @@ func (a *aggregator) sendDeal(ctx context.Context, aggCommp cid.Cid, url string)
 	if err != nil {
 		return fmt.Errorf("failed to create deal label: %w", err)
 	}
-
 	proposal := market.DealProposal{
 		PieceCID:             aggCommp,
 		PieceSize:            filabi.PaddedPieceSize(a.targetDealSize),
@@ -900,14 +876,8 @@ func (a *aggregator) transferHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No data found", http.StatusNotFound)
 		return
 	}
-	// First write the CAR prefix to the response
-	prefixCARBytes, err := hex.DecodeString(prefixCAR)
-	if err != nil {
-		http.Error(w, "Failed to decode CAR prefix", http.StatusInternalServerError)
-		return
-	}
 
-	readers := []io.Reader{bytes.NewReader(prefixCARBytes)}
+	readers := []io.Reader{}
 	// Fetch each sub piece from its buffer location and write to response
 	for _, url := range transfer.locations {
 		lazyReader := &lazyHTTPReader{url: url}
